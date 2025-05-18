@@ -123,6 +123,28 @@ var blpPlugin api.Plugin = api.Plugin{
 	},
 }
 
+
+type ReloadPluginOpts struct {
+	OnBuild func()
+	OnExit func()
+}
+
+func makeReloadPlugin(opts ReloadPluginOpts) api.Plugin {
+	return api.Plugin {
+		Name: "reload",
+		Setup: func(build api.PluginBuild) {
+			build.OnEnd(func(result *api.BuildResult) (api.OnEndResult, error) {
+				opts.OnBuild()
+				return api.OnEndResult{}, nil
+			})
+
+			build.OnDispose(func() {
+				opts.OnExit()
+			})
+		},
+	}
+}
+
 func sliceToKV(keyValuePairs []string) map[string]string {
 	pairs := make(map[string]string)
 	for _, pair := range keyValuePairs {
@@ -136,20 +158,7 @@ func sliceToKV(keyValuePairs []string) map[string]string {
 	return pairs
 }
 
-type BundleOpts struct {
-	Infile           string
-	Outfile          string
-	Defines          []string
-	Alias            []string
-	GtkVersion       uint
-	WorkingDirectory string
-}
-
-// TODO: bundle plugins
-// svg loader
-// other css preproceccors
-// http plugin with caching
-func Bundle(opts BundleOpts) api.BuildResult {
+func Prepare(opts BundleOpts) api.BuildOptions {
 	defines := sliceToKV(opts.Defines)
 	alias := sliceToKV(opts.Alias)
 
@@ -212,6 +221,26 @@ func Bundle(opts BundleOpts) api.BuildResult {
 		buildOpts.TsconfigRaw = GetTsconfig(Cwd(), opts.GtkVersion)
 	}
 
+	return buildOpts
+}
+
+type BundleOpts struct {
+	Infile           string
+	Outfile          string
+	Defines          []string
+	Alias            []string
+	GtkVersion       uint
+	WorkingDirectory string
+}
+
+// TODO: bundle plugins
+// svg loader
+// other css preproceccors
+// http plugin with caching
+
+func Bundle(opts BundleOpts) api.BuildResult {
+	buildOpts := Prepare(opts)
+
 	result := api.Build(buildOpts)
 
 	// TODO: custom error logs
@@ -220,4 +249,28 @@ func Bundle(opts BundleOpts) api.BuildResult {
 	}
 
 	return result
+}
+
+type WatchOpts struct {
+	BundleOpts
+	ReloadPluginOpts
+}
+
+func Watch(opts WatchOpts){
+	buildOpts := Prepare(opts.BundleOpts)
+
+	buildOpts.Plugins = append(buildOpts.Plugins, makeReloadPlugin(opts.ReloadPluginOpts))
+
+	ctx, ctxErr := api.Context(buildOpts)
+	if ctxErr != nil {
+		Err(ctxErr)
+	}
+
+	watchErr := ctx.Watch(api.WatchOptions{})
+
+	if watchErr != nil {
+		Err(watchErr)
+	}
+
+	<-make(chan struct{})
 }

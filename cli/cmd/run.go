@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 
@@ -15,6 +16,9 @@ var (
 	targetDir string
 	logFile   string
 	args      []string
+	watch     bool
+
+	activeGjsCmd *exec.Cmd
 )
 
 var runCommand = &cobra.Command{
@@ -58,6 +62,7 @@ when no positional argument is given
 	f.StringArrayVarP(&args, "arg", "a", []string{}, "cli args to pass to gjs")
 	f.UintVarP(&gtkVersion, "gtk", "g", 0, "gtk version")
 	f.StringVar(&logFile, "log-file", "", "file to redirect the stdout of gjs to")
+	f.BoolVarP(&watch, "watch", "w", false, "watch for changes and restart the app")
 	f.MarkHidden("package")
 	f.MarkHidden("alias")
 }
@@ -113,41 +118,121 @@ func logging() (io.Writer, io.Writer, *os.File) {
 	return io.MultiWriter(os.Stdout, file), io.MultiWriter(os.Stderr, file), file
 }
 
+// prepareGjsCommand prepares a new gjs command.
+// If an existing 'currentGjsCmdToKill' is provided and is not nil, it attempts to kill it.
+// 'cliArgs' are the user-provided arguments intended for the gjs process.
+func prepareGjsCommand(
+	currentGjsCmdToKill *exec.Cmd,
+	infile string,
+	outfile string,
+	stdout io.Writer,
+	stderr io.Writer,
+	isGtk4 bool,
+	gtk4LayerShellPath string,
+	cliArgs []string,
+) *exec.Cmd {
+	if currentGjsCmdToKill != nil && currentGjsCmdToKill.Process != nil {
+		if err := currentGjsCmdToKill.Process.Kill(); err != nil {
+			// Log error instead of exiting, especially useful in watch mode
+			fmt.Fprintf(os.Stderr, "Error killing previous gjs process: %v\n", err)
+		}
+		// Wait for the process to exit and release resources.
+		// Consider adding a timeout if Wait() could hang indefinitely.
+		currentGjsCmdToKill.Wait()
+	}
+
+	if isGtk4 {
+		os.Setenv("LD_PRELOAD", gtk4LayerShellPath)
+	}
+
+	// Arguments for the gjs executable: run as module, the output file, then user's CLI args
+	gjsExecutableArgs := append([]string{"-m", outfile}, cliArgs...)
+
+	newCmd := lib.Exec(gjs, gjsExecutableArgs...)
+	newCmd.Stdin = os.Stdin
+	newCmd.Dir = filepath.Dir(infile) // Set working directory to the input file's directory
+	newCmd.Stdout = stdout
+	newCmd.Stderr = stderr
+
+	return newCmd
+}
+
 func run(infile string, rootdir string) {
 	if gtkVersion == 0 {
 		gtkVersion = inferGtkVersion(infile)
 	}
+	isGtk4 := (gtkVersion == 4) // Determine GTK version status once
 
 	outfile := getOutfile()
 
-	lib.Bundle(lib.BundleOpts{
+	// Define bundle options once
+	bundleOptions := lib.BundleOpts{
 		Infile:           infile,
 		Outfile:          outfile,
 		Defines:          defines,
 		Alias:            alias,
 		GtkVersion:       gtkVersion,
 		WorkingDirectory: rootdir,
-	})
-
-	if gtkVersion == 4 {
-		os.Setenv("LD_PRELOAD", gtk4LayerShell)
 	}
 
-	args = append([]string{"-m", outfile}, args...)
-	stdout, stderr, file := logging()
-	gjs := lib.Exec("gjs", args...)
-	gjs.Stdin = os.Stdin
-	gjs.Dir = filepath.Dir(infile)
+	// Perform initial bundle
+	lib.Bundle(bundleOptions)
 
-	gjs.Stdout = stdout
-	gjs.Stderr = stderr
+	stdout, stderr, logFileHandle := logging() // Get configured log writers
 
-	// TODO: watch and restart
-	if err := gjs.Run(); err != nil {
-		lib.Err(err)
-	}
+	// Note: The global 'args' slice (populated by Cobra flags) is passed directly.
+	// 'prepareGjsCommand' now handles prepending "-m" and the outfile.
 
-	if file != nil {
-		file.Close()
+	if watch {
+		// For watch mode, 'activeGjsCmd' tracks the currently running process.
+		// Initial run:
+		activeGjsCmd = prepareGjsCommand(nil, infile, outfile, stdout, stderr, isGtk4, gtk4LayerShell, args)
+		if err := activeGjsCmd.Start(); err != nil {
+			if logFileHandle != nil {
+				logFileHandle.Close()
+			}
+			lib.Err(fmt.Errorf("failed to start gjs initially in watch mode: %w", err))
+		}
+
+		lib.Watch(lib.WatchOpts{
+			BundleOpts: bundleOptions, // Pass the bundle options for re-bundling
+			ReloadPluginOpts: lib.ReloadPluginOpts{
+				OnBuild: func() {
+					// On subsequent builds, 'activeGjsCmd' holds the command to be killed.
+					// The new command will be assigned back to 'activeGjsCmd'.
+					activeGjsCmd = prepareGjsCommand(activeGjsCmd, infile, outfile, stdout, stderr, isGtk4, gtk4LayerShell, args)
+					if err := activeGjsCmd.Start(); err != nil {
+						fmt.Fprintf(os.Stderr, "Failed to restart gjs: %v\n", err)
+						// Decide if watch should continue or exit on failed restart
+					}
+				},
+				OnExit: func() {
+					if logFileHandle != nil {
+						logFileHandle.Close()
+					}
+					// Ensure the last gjs process is killed if the watcher exits.
+					if activeGjsCmd != nil && activeGjsCmd.Process != nil {
+						activeGjsCmd.Process.Kill()
+						activeGjsCmd.Wait() // Wait for cleanup
+					}
+				},
+			},
+		})
+	} else {
+		// Non-watch mode: create command, run it synchronously, and clean up.
+		// No old process to kill, so pass nil for currentGjsCmdToKill.
+		cmd := prepareGjsCommand(nil, infile, outfile, stdout, stderr, isGtk4, gtk4LayerShell, args)
+		if err := cmd.Run(); err != nil {
+			// lib.Err will typically print the error and exit.
+			// Ensure logFileHandle is closed even on error before lib.Err exits.
+			if logFileHandle != nil {
+				logFileHandle.Close()
+			}
+			lib.Err(err) 
+		}
+
+		if logFileHandle != nil {
+			logFileHandle.Close()
+		}
 	}
 }
